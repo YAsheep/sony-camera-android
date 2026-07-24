@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- USB Host is required to talk to the camera over a wired connection. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!-- Foreground service keeps the USB/PTP session alive while the app is
+         backgrounded or swiped away. FOREGROUND_SERVICE_CONNECTED_DEVICE is
+         required on Android 14+ for a service attached to USB hardware. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application>
+        <!-- The foreground service that owns the USB camera connection.
+             Declared here so consuming apps get it automatically via manifest
+             merging — no need to copy it into your own manifest. -->
+        <service
+            android:name="io.github.gallo.sonycamera.service.CameraConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+
+</manifest>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sony cameras (vendor ID 0x054C = 1356 decimal) with a PTP interface
+         (still-image class 6, subclass 1, protocol 1).
+
+         Reference this from your launcher Activity's intent-filter so Android
+         offers to open your app when a Sony camera is plugged in:
+
+         <activity ...>
+             <intent-filter>
+                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+             </intent-filter>
+             <meta-data
+                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                 android:resource="@xml/sony_usb_device_filter" />
+         </activity>
+    -->
+    <usb-device vendor-id="1356" class="6" subclass="1" protocol="1" />
+</resources>

@@ -8,7 +8,6 @@ import android.graphics.Bitmap
 import android.hardware.usb.UsbDevice
 import android.os.IBinder
 import android.util.Log
-import androidx.core.content.ContextCompat
 import io.github.gallo.sonycamera.CameraConnectionManager
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
@@ -70,6 +69,8 @@ class CameraConnectionClient(
 
     /** A USB attach event that arrived before the binder was ready. */
     private var pendingAttach: UsbDevice? = null
+    /** A connect request that arrived before the binder was ready. */
+    private var pendingConnect = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -78,6 +79,8 @@ class CameraConnectionClient(
             binderFlow.value = cameraBinder
             val attach = pendingAttach
             pendingAttach = null
+            val connectRequested = pendingConnect
+            pendingConnect = false
             if (cameraBinder == null) return
 
             // Auto-connect on startup. If the process survived a swipe-away
@@ -88,9 +91,10 @@ class CameraConnectionClient(
             val alreadyConnected =
                 cameraBinder.connectionState.value !is CameraConnectionState.Disconnected
             when {
-                !alreadyConnected && (attach != null || cameraBinder.hasCameraAttached()) -> {
+                !alreadyConnected &&
+                        (connectRequested || attach != null || cameraBinder.hasCameraAttached()) -> {
                     Log.d(TAG, "Startup auto-connect: camera attached, connecting")
-                    connectToCamera()
+                    cameraBinder.requestConnection()
                 }
                 attach != null -> cameraBinder.onUsbDeviceAttached(attach)
             }
@@ -142,15 +146,17 @@ class CameraConnectionClient(
     // ── Commands ────────────────────────────────────────────────────────────
 
     /**
-     * Connect to a Sony camera over USB. Starts the service in the foreground
-     * so the connection survives the app being swiped away. Works even if the
-     * binder has not landed yet — the service handles the intent on its own.
+     * Connect to a Sony camera over USB. The bound service first requests USB
+     * access; only after Android grants access does it promote itself to a
+     * foreground service. Works even if the binder has not landed yet.
      */
     fun connectToCamera() {
-        ContextCompat.startForegroundService(
-            context,
-            CameraConnectionService.connectIntent(context)
-        )
+        val binder = binderFlow.value
+        if (binder == null) {
+            pendingConnect = true
+        } else {
+            binder.requestConnection()
+        }
     }
 
     override fun disconnect() {

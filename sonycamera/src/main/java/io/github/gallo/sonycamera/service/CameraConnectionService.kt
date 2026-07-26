@@ -42,8 +42,9 @@ import kotlinx.coroutines.launch
  * Uptime levers implemented here:
  * 1. Self-recovery — START_STICKY: if Android kills the process while a
  *    camera is connected, the service is recreated and reconnects.
- * 2. Watchdog — a heartbeat coroutine that restarts a stalled liveview and
- *    auto-retries a failed connection while a camera is physically present.
+ * 2. Watchdog — a heartbeat coroutine that restarts a stalled liveview.
+ *    Initialization errors remain stable until an explicit reconnect, so a
+ *    blocked synchronous USB read cannot overlap an automatic retry.
  *
  * The notification's icon and copy come from [SonyCamera.notificationConfig].
  */
@@ -61,10 +62,6 @@ class CameraConnectionService : Service() {
         // If the camera is Ready but no liveview frame has arrived in this
         // long, the liveview loop is stalled — restart it (cheap, no USB reset).
         private const val LIVEVIEW_STALL_MS = 10_000L
-        // Max consecutive auto-reconnect attempts on a connection Error before
-        // the watchdog backs off and leaves the error for the user to resolve.
-        private const val MAX_WATCHDOG_RETRIES = 3
-
         /** Intent that starts the service in the foreground and connects. */
         fun connectIntent(context: Context): Intent =
             Intent(context, CameraConnectionService::class.java).setAction(ACTION_CONNECT)
@@ -104,7 +101,7 @@ class CameraConnectionService : Service() {
         /** Whether a Sony PTP camera is currently plugged into USB. */
         fun hasCameraAttached(): Boolean = engine.findSonyCamera() != null
 
-        fun connectToCamera() = engine.connectToCamera()
+        fun requestConnection() = this@CameraConnectionService.handleConnectRequest()
         fun onUsbDeviceAttached(device: android.hardware.usb.UsbDevice) =
             engine.onUsbDeviceAttached(device)
 
@@ -121,13 +118,15 @@ class CameraConnectionService : Service() {
 
     /** Elapsed-realtime of the last liveview frame; 0 until the first frame. */
     @Volatile private var lastFrameTime = 0L
-    private var watchdogRetries = 0
     private var isForeground = false
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service created")
-        engine = UsbCameraConnectionManager(applicationContext)
+        engine = UsbCameraConnectionManager(
+            context = applicationContext,
+            onUsbPermissionGranted = { handleUsbPermissionGranted() }
+        )
 
         // Drive foreground lifecycle + notification from the connection state.
         scope.launch {
@@ -151,8 +150,8 @@ class CameraConnectionService : Service() {
         // unplugged when this fires (very common for sticky restarts), going
         // foreground would crash the process and put us in a crash-loop.
         // Guard the foreground promotion on actually having a camera attached.
-        val cameraAttached = engine.findSonyCamera() != null
-        if (!cameraAttached) {
+        val camera = engine.findSonyCamera()
+        if (camera == null) {
             Log.d(TAG, "onStartCommand with no camera attached — skipping " +
                     "foreground and stopping. Will be re-started on USB attach.")
             // Do NOT call startForeground here — it would SecurityException.
@@ -164,7 +163,22 @@ class CameraConnectionService : Service() {
             return START_NOT_STICKY
         }
 
-        enterForeground(engine.connectionState.value)
+        // Android 14+ validates the connectedDevice runtime prerequisite when
+        // startForeground() runs. Merely seeing the device is insufficient:
+        // UsbManager.requestPermission() must already have completed.
+        if (!engine.hasUsbPermission(camera)) {
+            Log.w(TAG, "Foreground start requested before USB permission was granted — stopping")
+            engine.reportConnectionError(
+                "USB access is required. Reconnect the camera and allow access."
+            )
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+
+        if (!tryEnterForeground(engine.connectionState.value)) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
 
         when (intent?.action) {
             ACTION_CONNECT -> {
@@ -210,15 +224,40 @@ class CameraConnectionService : Service() {
     }
 
     private fun enterForeground(state: CameraConnectionState) {
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        } else 0
-        if (type != 0) {
-            startForeground(NOTIFICATION_ID, buildNotification(state), type)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification(state),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
         } else {
             startForeground(NOTIFICATION_ID, buildNotification(state))
         }
         isForeground = true
+    }
+
+    /**
+     * Prevent platform/OEM foreground-service policy failures from crashing
+     * the entire app process.
+     */
+    private fun tryEnterForeground(state: CameraConnectionState): Boolean {
+        return try {
+            enterForeground(state)
+            true
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Connected-device foreground prerequisites not satisfied", e)
+            engine.reportConnectionError(
+                "Android did not allow the camera service. Reconnect the camera and allow USB access."
+            )
+            false
+        } catch (e: IllegalStateException) {
+            // Includes ForegroundServiceStartNotAllowedException on Android 12+.
+            Log.e(TAG, "Foreground service start is not allowed in the current app state", e)
+            engine.reportConnectionError(
+                "Open the app and connect the camera again."
+            )
+            false
+        }
     }
 
     private fun updateNotification(state: CameraConnectionState) {
@@ -253,6 +292,49 @@ class CameraConnectionService : Service() {
         engine.disconnect()
     }
 
+    /**
+     * Entry point for user/attach-driven connection requests. USB permission
+     * is acquired while this service is only bound; foreground promotion is
+     * deliberately deferred until Android reports that permission was granted.
+     */
+    private fun handleConnectRequest() {
+        val camera = engine.findSonyCamera()
+        if (camera == null) {
+            engine.connectToCamera()
+            return
+        }
+
+        if (engine.hasUsbPermission(camera)) {
+            startForegroundConnection()
+        } else {
+            Log.d(TAG, "Requesting USB permission before foreground promotion")
+            engine.requestUsbPermission(camera)
+        }
+    }
+
+    /** Continue the connection only after UsbManager confirms access. */
+    private fun handleUsbPermissionGranted() {
+        Log.d(TAG, "USB permission ready — starting connected-device foreground service")
+        startForegroundConnection()
+    }
+
+    private fun startForegroundConnection() {
+        try {
+            ContextCompat.startForegroundService(this, connectIntent(this))
+        } catch (e: IllegalStateException) {
+            // Includes ForegroundServiceStartNotAllowedException on Android 12+.
+            Log.e(TAG, "Unable to start camera foreground service", e)
+            engine.reportConnectionError(
+                "Open the app and connect the camera again."
+            )
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Unable to start camera foreground service", e)
+            engine.reportConnectionError(
+                "Android did not allow USB camera access."
+            )
+        }
+    }
+
     // ── Watchdog (uptime lever 2) ────────────────────────────────────────────
 
     private fun startWatchdog() {
@@ -267,7 +349,14 @@ class CameraConnectionService : Service() {
     private suspend fun runWatchdogCheck() {
         when (engine.connectionState.value) {
             is CameraConnectionState.Ready -> {
-                watchdogRetries = 0
+                if (engine.isCapturing()) {
+                    // Liveview is deliberately stopped while shutter and
+                    // photo-transfer commands own the PTP link. Treat this as
+                    // healthy and move the watchdog baseline forward; forcing
+                    // a restart here would interleave GetObject with 0x9207.
+                    lastFrameTime = SystemClock.elapsedRealtime()
+                    return
+                }
                 val sinceFrame = SystemClock.elapsedRealtime() - lastFrameTime
                 // Only act once we've seen at least one frame — the engine's
                 // own liveview loop handles the never-got-a-frame case.
@@ -279,17 +368,11 @@ class CameraConnectionService : Service() {
                     lastFrameTime = SystemClock.elapsedRealtime()
                 }
             }
-            is CameraConnectionState.Error -> {
-                // A camera is still physically attached but the connection
-                // errored — retry automatically a bounded number of times.
-                if (engine.findSonyCamera() != null && watchdogRetries < MAX_WATCHDOG_RETRIES) {
-                    watchdogRetries++
-                    Log.w(TAG, "Connection error with camera attached — " +
-                            "auto-retry $watchdogRetries/$MAX_WATCHDOG_RETRIES")
-                    engine.connectToCamera()
-                }
-            }
-            is CameraConnectionState.Disconnected -> watchdogRetries = 0
+            // Keep initialization failures stable. The user can explicitly
+            // reconnect after fixing USB/camera state, but the watchdog must
+            // never start a second PTP handshake behind a blocked first one.
+            is CameraConnectionState.Error,
+            is CameraConnectionState.Disconnected -> Unit
             // Connecting / Initializing / Scanning — a connection attempt is
             // already in flight; leave it alone.
             else -> Unit

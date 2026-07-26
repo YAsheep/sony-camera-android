@@ -22,6 +22,7 @@ import io.github.gallo.sonycamera.CameraOperationResult
 import io.github.gallo.sonycamera.ptp.PtpConstants
 import io.github.gallo.sonycamera.ptp.PtpTransport
 import io.github.gallo.sonycamera.ptp.SonyPtpCamera
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -37,7 +38,11 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * USB PTP camera connection engine for Sony cameras.
@@ -54,7 +59,15 @@ import kotlinx.coroutines.withContext
  * service, watchdog, process-death recovery). Call [destroy] to tear down.
  */
 class UsbCameraConnectionManager(
-    private val context: Context
+    private val context: Context,
+    /**
+     * Invoked for an initial connection after Android grants USB access.
+     *
+     * The owning service uses this callback to start itself as a
+     * connected-device foreground service. Android 14+ requires the USB grant
+     * to exist before startForeground() is called.
+     */
+    private val onUsbPermissionGranted: ((UsbDevice) -> Unit)? = null
 ) : CameraConnectionManager {
 
     companion object {
@@ -68,6 +81,10 @@ class UsbCameraConnectionManager(
         private const val RECONNECT_GRACE_MS = 7_000L
         // How often we poll usbManager.deviceList during the grace window.
         private const val REATTACH_POLL_INTERVAL_MS = 400L
+        // OEM USB drivers can occasionally ignore a synchronous transfer's
+        // timeout. Closing the local handle is the only reliable way to break
+        // such an initialization stall and surface a deterministic Error.
+        private const val PTP_INITIALIZATION_TIMEOUT_MS = 30_000L
     }
 
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -103,13 +120,17 @@ class UsbCameraConnectionManager(
     private var usbConnection: UsbDeviceConnection? = null
     private var ptpInterface: UsbInterface? = null
     private var ptpCamera: SonyPtpCamera? = null
+    private var eventListenerJob: Job? = null
     private var liveviewJob: Job? = null
-    private var isLiveviewActive = false
+    @Volatile private var isLiveviewActive = false
+    private val liveviewMutex = Mutex()
+    private val captureInProgress = AtomicBoolean(false)
 
     // In-flight connect job. Tracking it lets disconnect / detach cancel a
     // connect attempt that's mid-handshake so its coroutine can run its
     // finally-block cleanup instead of leaking a claimed interface.
     private var connectJob: Job? = null
+    private val connectMutex = Mutex()
 
     // Reconnect bookkeeping. When the cable is physically detached we don't
     // immediately surface ConnectionLost — we hold the UI in "Connecting" for
@@ -132,8 +153,12 @@ class UsbCameraConnectionManager(
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                     if (granted && device != null) {
                         Log.d(TAG, "USB permission granted for ${device.deviceName}")
-                        connectJob?.cancel()
-                        connectJob = scope.launch { connectToDevice(device) }
+                        val callback = onUsbPermissionGranted
+                        if (callback != null) {
+                            callback(device)
+                        } else {
+                            scheduleConnection(device)
+                        }
                     } else {
                         Log.w(TAG, "USB permission denied")
                         _connectionState.value = CameraConnectionState.Error(
@@ -275,9 +300,11 @@ class UsbCameraConnectionManager(
     // CameraConnectionManager implementation
     // ══════════════════════════════════════════════
 
-    override suspend fun startLiveview(): CameraOperationResult {
-        if (ptpCamera == null) return CameraOperationResult.Failure("Camera not connected")
-        if (isLiveviewActive) return CameraOperationResult.Success
+    override suspend fun startLiveview(): CameraOperationResult = liveviewMutex.withLock {
+        if (ptpCamera == null) return@withLock CameraOperationResult.Failure("Camera not connected")
+        if (isLiveviewActive && liveviewJob?.isActive == true) {
+            return@withLock CameraOperationResult.Success
+        }
 
         isLiveviewActive = true
         liveviewJob = scope.launch(Dispatchers.IO) {
@@ -311,6 +338,12 @@ class UsbCameraConnectionManager(
                     val frameStart = System.currentTimeMillis()
                     val jpeg = ptpCamera?.getLiveViewFrame()
 
+                    // A synchronous Android USB transfer cannot be cancelled
+                    // while it is inside the kernel. Re-check immediately
+                    // after it returns so stopLiveview() cannot fall through
+                    // into endpoint recovery while capture is waiting.
+                    if (!isActive || !isLiveviewActive) break
+
                     if (jpeg != null) {
                         val bitmap = BitmapFactory.decodeByteArray(
                             jpeg, 0, jpeg.size, liveviewDecodeOptions
@@ -340,10 +373,13 @@ class UsbCameraConnectionManager(
                         // user is prompted to do that.
                         val sinceStart = System.currentTimeMillis() - liveviewStartTime
                         if (!hasEverGottenFrame && sinceStart > neverGotFrameFatalMs) {
+                            val message = "Live view failed to start. Reconnect the camera and try again."
                             Log.e(TAG, "Liveview never produced a frame in ${sinceStart}ms — " +
-                                    "camera state wedged. Surfacing ConnectionLost.")
+                                    "switching the connection to Error.")
                             isLiveviewActive = false
-                            _events.emit(CameraEvent.ConnectionLost)
+                            _connectionState.value = CameraConnectionState.Error(message)
+                            _events.emit(CameraEvent.Error(message))
+                            closeUsbResources()
                             break
                         }
 
@@ -386,111 +422,105 @@ class UsbCameraConnectionManager(
             Log.d(TAG, "USB liveview loop ended")
         }
 
-        return CameraOperationResult.Success
+        CameraOperationResult.Success
     }
 
-    override suspend fun stopLiveview(): CameraOperationResult {
+    override suspend fun stopLiveview(): CameraOperationResult = liveviewMutex.withLock {
         isLiveviewActive = false
-        liveviewJob?.cancel()
+        val job = liveviewJob
         liveviewJob = null
-        return CameraOperationResult.Success
+        job?.cancelAndJoin()
+        Log.d(TAG, "USB liveview fully stopped")
+        CameraOperationResult.Success
     }
 
-    override suspend fun takePhoto(): CameraOperationResult = try {
-        // Hard ceiling on total capture time. The retry logic below bounds
-        // itself at ~18.5s (10s + 0.5s + 8s queue waits), so 25s absorbs
-        // normal jitter without ever letting a truly stuck call hang the UI.
-        kotlinx.coroutines.withTimeout(25_000) {
-            takePhotoInner()
+    override suspend fun takePhoto(): CameraOperationResult {
+        if (!captureInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "Ignoring duplicate capture request")
+            return CameraOperationResult.Failure("A photo is already being captured")
         }
-    } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-        Log.e(TAG, "takePhoto timed out after 25s")
-        CameraOperationResult.Failure("Capture took too long — please try again")
+
+        return try {
+            // Hard ceiling on total capture time. It also covers waiting for
+            // an in-flight synchronous liveview transfer to return.
+            kotlinx.coroutines.withTimeout(25_000) {
+                takePhotoInner()
+            }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            Log.e(TAG, "takePhoto timed out after 25s")
+            CameraOperationResult.Failure("Capture took too long — please try again")
+        } finally {
+            captureInProgress.set(false)
+        }
     }
 
     private suspend fun takePhotoInner(): CameraOperationResult = withContext(Dispatchers.IO) {
         val camera = ptpCamera
             ?: return@withContext CameraOperationResult.Failure("Camera not connected")
 
-        // Liveview is intentionally NOT stopped here. It keeps running through
-        // initiateCapture()'s autofocus phase so the preview stays live right
-        // up to the shutter — it is torn down inside the shutter callback
-        // below, at the exact full-press moment. PtpTransport serialises every
-        // transaction, so at most one in-flight liveview frame can overlap the
-        // full-press; the capture exposure, readout, and multi-second photo
-        // download that follow run with liveview already stopped.
         val wasLiveview = isLiveviewActive
 
         try {
-            // Two attempts max. Each: fire shutter, then wait for the photo to
-            // appear in Sony's PhotoTransferQueue and download it. The most
-            // common failure mode we've seen is the camera silently dropping
-            // the shutter (queue count stays at 0). Re-firing recovers it.
-            // There is no silent fallback to a liveview thumbnail — if we
-            // can't deliver a full-res frame the caller must know.
-            // initiateCapture() invokes its callback at the exact full-press
-            // moment — the real shutter — so the UI flash coincides with the
-            // capture instead of leading it. Signal only once across retries.
-            var shutterSignalled = false
-            for (attempt in 1..2) {
-                Log.d(TAG, "Capture attempt $attempt/2")
-
-                val captureFired = camera.initiateCapture {
-                    if (!shutterSignalled) {
-                        shutterSignalled = true
-                        // Real shutter moment: stop liveview so it doesn't
-                        // contend with the capture, then flash the UI.
-                        isLiveviewActive = false
-                        liveviewJob?.cancel()
-                        liveviewJob = null
-                        _events.tryEmit(CameraEvent.ShutterFired)
-                        Log.d(TAG, "Shutter fired — liveview stopped, flash signalled")
-                    }
-                }
-                if (!captureFired) {
-                    Log.w(TAG, "Shutter command failed on attempt $attempt")
-                    if (attempt < 2) {
-                        delay(500)
-                        continue
-                    }
-                    return@withContext CameraOperationResult.Failure(
-                        "Camera didn't respond to shutter — please try again"
-                    )
-                }
-
-                val queueWaitMs = if (attempt == 1) 10_000L else 8_000L
-                val fullResJpeg = try {
-                    camera.downloadQueuedPhoto(maxWaitMs = queueWaitMs)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Download error on attempt $attempt: ${e.message}")
-                    null
-                }
-
-                // Size floor: a real Sony A6600 JPEG is several MB. Anything
-                // under ~200KB is either Sony's error stub or a truncated
-                // transfer — treat as failure so we retry or fail loudly
-                // rather than emitting a visibly-bad photo.
-                if (fullResJpeg != null && fullResJpeg.size >= 200_000) {
-                    val bitmap = BitmapFactory.decodeByteArray(fullResJpeg, 0, fullResJpeg.size)
-                    if (bitmap != null) {
-                        Log.d(TAG, "Photo captured (full-res): " +
-                                "${fullResJpeg.size / 1024}KB, ${bitmap.width}x${bitmap.height} " +
-                                "on attempt $attempt")
-                        _events.emit(CameraEvent.PhotoCaptured(bitmap))
-                        return@withContext CameraOperationResult.Success
-                    }
-                    Log.w(TAG, "Full-res JPEG decode failed on attempt $attempt " +
-                            "(size=${fullResJpeg.size}B)")
-                } else {
-                    Log.w(TAG, "Full-res download failed on attempt $attempt " +
-                            "(size=${fullResJpeg?.size ?: 0}B)")
-                }
-
-                if (attempt < 2) delay(500)
+            // Stop and JOIN the liveview job before any 0x9207 command. Merely
+            // flipping the flag/cancelling is insufficient because Android's
+            // synchronous bulkTransfer continues until it returns. Starting
+            // shutter traffic before that point desynchronizes Bulk IN and
+            // can make the preview recovery path drain capture responses.
+            if (wasLiveview) {
+                Log.d(TAG, "Capture: stopping liveview before shutter commands")
+                stopLiveview()
             }
 
-            // Both attempts failed — surface a clear error. No thumbnail fallback.
-            CameraOperationResult.Failure("Photo didn't save — please try again")
+            // Fire the shutter exactly once. A transfer/download failure must
+            // never be treated as permission to take a second photograph.
+            // Re-firing made one UI tap create two exposures and kept
+            // liveview paused long enough for the service watchdog to race it.
+            // initiateCapture() invokes its callback at the exact full-press
+            // moment — the real shutter — so the UI flash coincides with the
+            // capture instead of leading it.
+            Log.d(TAG, "Capture attempt 1/1")
+            var shutterSignalled = false
+            val captureFired = camera.initiateCapture {
+                if (!shutterSignalled) {
+                    shutterSignalled = true
+                    _events.tryEmit(CameraEvent.ShutterFired)
+                    Log.d(TAG, "Shutter fired — flash signalled")
+                }
+            }
+            if (!captureFired) {
+                Log.w(TAG, "Shutter command failed")
+                return@withContext CameraOperationResult.Failure(
+                    "Camera didn't respond to shutter — please try again"
+                )
+            }
+
+            // Keep the preview pause bounded. The photo may be saved correctly
+            // on the camera even when PC-transfer queue metadata is unavailable.
+            val fullResJpeg = try {
+                camera.downloadQueuedPhoto(maxWaitMs = 6_000L)
+            } catch (e: Exception) {
+                Log.w(TAG, "Download error: ${e.message}")
+                null
+            }
+
+            // Size floor: a real Sony JPEG is several MB. Anything under
+            // ~200KB is an error stub or truncated transfer.
+            if (fullResJpeg != null && fullResJpeg.size >= 200_000) {
+                val bitmap = BitmapFactory.decodeByteArray(fullResJpeg, 0, fullResJpeg.size)
+                if (bitmap != null) {
+                    Log.d(TAG, "Photo captured (full-res): " +
+                            "${fullResJpeg.size / 1024}KB, ${bitmap.width}x${bitmap.height}")
+                    _events.emit(CameraEvent.PhotoCaptured(bitmap))
+                    return@withContext CameraOperationResult.Success
+                }
+                Log.w(TAG, "Full-res JPEG decode failed (size=${fullResJpeg.size}B)")
+            } else {
+                Log.w(TAG, "Full-res download unavailable (size=${fullResJpeg?.size ?: 0}B)")
+            }
+
+            CameraOperationResult.Failure(
+                "Photo was taken, but its preview could not be downloaded"
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Photo capture error", e)
             // Never surface raw exception text to the user — those messages
@@ -498,10 +528,19 @@ class UsbCameraConnectionManager(
             // user-facing string consistent with the other capture failures.
             CameraOperationResult.Failure("Photo capture failed — please try again")
         } finally {
-            if (wasLiveview) {
+            if (wasLiveview &&
+                ptpCamera === camera &&
+                _connectionState.value is CameraConnectionState.Ready) {
                 withContext(kotlinx.coroutines.NonCancellable) {
-                    delay(1500)
+                    // Capture/download can leave the bulk endpoints halted
+                    // even though every PTP transaction has completed. Recover
+                    // here while the event pump is still paused instead of
+                    // making the new liveview loop wait for its 5s stall
+                    // detector to do the same work.
+                    camera.flushAndResetPipe()
+                    delay(250)
                     startLiveview()
+                    Log.d(TAG, "Capture: liveview restarted")
                 }
             }
         }
@@ -555,6 +594,8 @@ class UsbCameraConnectionManager(
         isLiveviewActive = false
         liveviewJob?.cancel()
         liveviewJob = null
+        eventListenerJob?.cancel()
+        eventListenerJob = null
 
         // Cancel any in-flight connect so its finally-block unwinds the
         // resources it allocated rather than silently committing them after
@@ -602,6 +643,9 @@ class UsbCameraConnectionManager(
 
     override fun isReady(): Boolean = _connectionState.value is CameraConnectionState.Ready
 
+    /** Used by the service watchdog to avoid restarting liveview during capture. */
+    fun isCapturing(): Boolean = captureInProgress.get()
+
     // ══════════════════════════════════════════════
     // USB-specific methods
     // ══════════════════════════════════════════════
@@ -613,6 +657,49 @@ class UsbCameraConnectionManager(
         return usbManager.deviceList.values.firstOrNull { device ->
             device.vendorId == PtpConstants.SONY_VENDOR_ID && hasPtpInterface(device)
         }
+    }
+
+    /** Whether Android has granted this process access to [device]. */
+    fun hasUsbPermission(device: UsbDevice): Boolean = usbManager.hasPermission(device)
+
+    /**
+     * Ask Android for access to [device].
+     *
+     * This must happen before the owning service promotes itself to a
+     * connected-device foreground service on Android 14+.
+     */
+    fun requestUsbPermission(device: UsbDevice) {
+        _connectionState.value = CameraConnectionState.Connecting
+
+        if (usbManager.hasPermission(device)) {
+            val callback = onUsbPermissionGranted
+            if (callback != null) {
+                callback(device)
+            } else {
+                scheduleConnection(device)
+            }
+            return
+        }
+
+        Log.d(TAG, "Requesting USB permission for ${device.deviceName}")
+        val intent = Intent(ACTION_USB_PERMISSION).apply {
+            setPackage(context.packageName)
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE or
+                    PendingIntent.FLAG_ALLOW_UNSAFE_IMPLICIT_INTENT
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val permissionIntent = PendingIntent.getBroadcast(context, 0, intent, flags)
+        usbManager.requestPermission(device, permissionIntent)
+    }
+
+    /** Surface a service-start failure through the normal connection state. */
+    fun reportConnectionError(message: String) {
+        _connectionState.value = CameraConnectionState.Error(message)
     }
 
     /**
@@ -630,24 +717,30 @@ class UsbCameraConnectionManager(
         _connectionState.value = CameraConnectionState.Connecting
 
         if (usbManager.hasPermission(target)) {
-            connectJob?.cancel()
-            connectJob = scope.launch { connectToDevice(target) }
+            scheduleConnection(target)
         } else {
-            Log.d(TAG, "Requesting USB permission for ${target.deviceName}")
-            // Explicit intent required on Android 14+ (targeting U+)
-            val intent = Intent(ACTION_USB_PERMISSION).apply {
-                setPackage(context.packageName)
+            requestUsbPermission(target)
+        }
+    }
+
+    /**
+     * Start exactly one USB handshake at a time.
+     *
+     * Cancelling a coroutine does not interrupt Android's synchronous
+     * bulkTransfer(), so a replacement must join the previous attempt and
+     * also pass through a mutex before it may claim/open the PTP interface.
+     */
+    private fun scheduleConnection(device: UsbDevice) {
+        if (connectJob?.isActive == true) {
+            Log.d(TAG, "Connection request ignored: a PTP handshake is already running")
+            return
+        }
+        val previous = connectJob
+        connectJob = scope.launch {
+            previous?.cancelAndJoin()
+            connectMutex.withLock {
+                connectToDevice(device)
             }
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE or
-                        PendingIntent.FLAG_ALLOW_UNSAFE_IMPLICIT_INTENT
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-            } else {
-                PendingIntent.FLAG_UPDATE_CURRENT
-            }
-            val permissionIntent = PendingIntent.getBroadcast(context, 0, intent, flags)
-            usbManager.requestPermission(target, permissionIntent)
         }
     }
 
@@ -665,7 +758,12 @@ class UsbCameraConnectionManager(
         var localIface: UsbInterface? = null
         var ifaceClaimed = false
         var localCamera: SonyPtpCamera? = null
+        var localEventListener: Job? = null
         var committed = false
+        val connectionRef = AtomicReference<UsbDeviceConnection?>()
+        val initializationFinished = AtomicBoolean(false)
+        val initializationTimedOut = AtomicBoolean(false)
+        var initializationWatchdog: Thread? = null
 
         try {
             _connectionState.value = CameraConnectionState.Connecting
@@ -698,6 +796,30 @@ class UsbCameraConnectionManager(
                     "Couldn't open the camera. Unplug the USB cable, wait a moment, then plug it back in."
                 )
                 return@withContext
+            }
+            connectionRef.set(localConn)
+
+            // Use a dedicated daemon thread rather than a coroutine timer:
+            // it must survive service-scope cancellation and an OEM native
+            // USB call that has stopped dispatching coroutine work.
+            initializationWatchdog = Thread({
+                Log.d(TAG, "PTP initialization watchdog running (${PTP_INITIALIZATION_TIMEOUT_MS}ms)")
+                try {
+                    Thread.sleep(PTP_INITIALIZATION_TIMEOUT_MS)
+                } catch (_: InterruptedException) {
+                    Log.d(TAG, "PTP initialization watchdog disarmed")
+                    return@Thread
+                }
+                if (initializationFinished.compareAndSet(false, true)) {
+                    initializationTimedOut.set(true)
+                    val message = "PTP initialization timed out. Unplug and reconnect the camera."
+                    Log.e(TAG, "$message Closing the stalled USB handle.")
+                    _connectionState.value = CameraConnectionState.Error(message)
+                    connectionRef.getAndSet(null)?.close()
+                }
+            }, "SonyPtpInitWatchdog").apply {
+                isDaemon = true
+                start()
             }
 
             // Force-claim the interface. The `true` parameter detaches any kernel
@@ -736,71 +858,121 @@ class UsbCameraConnectionManager(
                 }
             }
 
-            if (bulkIn == null || bulkOut == null) {
+            if (bulkIn == null || bulkOut == null || interruptIn == null) {
+                Log.e(TAG, "Missing required PTP endpoints: bulkIn=${bulkIn != null}, " +
+                        "bulkOut=${bulkOut != null}, interruptIn=${interruptIn != null}")
                 _connectionState.value = CameraConnectionState.Error(
-                    "Camera USB mode is wrong. In the camera menu, set USB Connection to 'PC Remote' or 'Auto'."
+                    "The camera did not expose all required PTP endpoints. Set USB Connection to 'PC Remote' or 'Auto'."
                 )
                 return@withContext
             }
 
             _connectionState.value = CameraConnectionState.Initializing
 
-            // Single-attempt PTP handshake. We intentionally do NOT retry
-            // by closing and reopening the USB device — that "heavy reset"
-            // was observed to push the Sony a6600 firmware into a wedged
-            // state where every subsequent command times out with General
-            // Error, requiring a battery pull to recover. When the camera
-            // is mid-session (swipe-away scenario) it keeps pumping liveview
-            // data into the pipe; closing+reopening just re-fills the pipe
-            // and confuses the camera further. If this attempt fails, we
-            // surface a clear error asking the user to unplug/replug — the
-            // physical detach-reattach path is reliable and triggers our
-            // auto-reconnect flow cleanly.
+            // A fresh PTP handshake starts directly with OpenSession. Device
+            // Reset is a recovery request, not a normal enumeration step; the
+            // previous unconditional reset could leave the Sony state machine
+            // resetting just as GetDeviceInfo arrived.
             val transport = PtpTransport(localConn, bulkOut, bulkIn, interruptIn)
-            Log.d(TAG, "Sending PTP device reset...")
-            transport.resetDevice()
+            val camera = SonyPtpCamera(transport)
+            localCamera = camera
 
-            localCamera = SonyPtpCamera(transport)
+            // Create the Interrupt IN listener before OpenSession so the
+            // listener lifecycle is bound to this connection. Event polling
+            // starts only after the Sony remote handshake and liveview startup
+            // have completed. PtpTransport serializes each short synchronous
+            // event read with Bulk commands for OEM USB-host compatibility.
+            val listenerStarted = CompletableDeferred<Unit>()
+            val remoteModeReady = CompletableDeferred<Unit>()
+            camera.setEventPumpActive(true)
+            localEventListener = scope.launch(Dispatchers.IO) {
+                Log.d(TAG, "Interrupt IN listener started")
+                listenerStarted.complete(Unit)
+                try {
+                    remoteModeReady.await()
+                    Log.d(TAG, "Interrupt IN polling active")
+                    while (isActive) {
+                        if (captureInProgress.get()) {
+                            // Capture/download owns the PTP link. Even though
+                            // all transfers share a lock, avoiding Interrupt
+                            // IN requests here removes needless lock handoffs
+                            // and OEM USB-host edge cases during 0x9207.
+                            delay(50)
+                            continue
+                        }
+                        val event = camera.pumpInterruptEvent(10)
+                        if (event != null) {
+                            Log.d(TAG, "PTP event 0x${event.eventCode.toString(16)} " +
+                                    "tx=${event.transactionId} params=${event.params.contentToString()}")
+                        }
+                        // Avoid starving liveview on the fair, shared USB lock.
+                        delay(50)
+                    }
+                } finally {
+                    camera.setEventPumpActive(false)
+                    Log.d(TAG, "Interrupt IN listener stopped")
+                }
+            }
+            listenerStarted.await()
 
-            if (!localCamera.openSession()) {
+            Log.d(TAG, "PTP step 1/6: OpenSession (0x1002)")
+            if (!camera.openSession()) {
                 _connectionState.value = CameraConnectionState.Error(
                     "Can't talk to the camera. Unplug the USB cable, wait a moment, then plug it back in."
                 )
                 return@withContext
             }
 
-            if (!localCamera.getDeviceInfo()) {
-                Log.w(TAG, "Could not get device info, continuing anyway")
+            Log.d(TAG, "PTP step 2/6: GetDeviceInfo (0x1001)")
+            if (!camera.getDeviceInfo()) {
+                val message = "PTP initialization failed: the camera did not return device information."
+                Log.e(TAG, message)
+                _connectionState.value = CameraConnectionState.Error(message)
+                return@withContext
             }
 
-            // Initialize Sony vendor extension (required for Sony-specific commands)
-            localCamera.initSonyExtension()
+            // Executes Sony SDIO 0x9201 phases, the 0x9202 extended-info
+            // capability handshake, property discovery, and 0x9205 priority.
+            Log.d(TAG, "PTP steps 3-6/6: Sony SDIO/remote initialization")
+            if (!camera.initSonyExtension()) {
+                val message = "Sony remote initialization failed. Reconnect the camera and try again."
+                Log.e(TAG, message)
+                _connectionState.value = CameraConnectionState.Error(message)
+                return@withContext
+            }
 
             // Commit: take ownership of the resources.
             usbDevice = device
             usbConnection = localConn
             ptpInterface = localIface
-            ptpCamera = localCamera
+            ptpCamera = camera
+            eventListenerJob = localEventListener
             committed = true
 
-            _cameraName.value = localCamera.deviceName ?: "Sony Camera (USB)"
-            _connectionState.value = CameraConnectionState.Ready
-
-            Log.d(TAG, "USB camera connected: ${localCamera.deviceName}")
-
-            // Pre-warm the shutter pipeline BEFORE starting liveview. The
-            // first SetControlDeviceB(SHUTTER) on a fresh PC-Remote session
-            // takes ~8s for the camera firmware to context-switch into
-            // capture-handling mode. Doing it here (inside the connection
-            // flow the user is already waiting on) means the user's first
-            // real shot uses the fast path. Done before liveview so the
-            // pre-warm itself isn't fighting liveview for the PTP lock.
-            localCamera.prewarmShutter()
+            _cameraName.value = camera.deviceName ?: "Sony Camera (USB)"
 
             // Auto-start liveview — camera is already in PC Remote mode
             // with liveview active after SDIO init
             Log.d(TAG, "Auto-starting USB liveview...")
-            startLiveview()
+            val liveviewResult = startLiveview()
+            if (liveviewResult is CameraOperationResult.Failure) {
+                val message = "Live view could not be started: ${liveviewResult.message}"
+                Log.e(TAG, message)
+                _connectionState.value = CameraConnectionState.Error(message)
+                closeUsbResources()
+                return@withContext
+            }
+            remoteModeReady.complete(Unit)
+
+            if (!initializationFinished.compareAndSet(false, true)) {
+                // The watchdog won the race and already closed this handle.
+                // Preserve its Error state and never publish Ready.
+                closeUsbResources()
+                return@withContext
+            }
+            initializationWatchdog?.interrupt()
+            _connectionState.value = CameraConnectionState.Ready
+            Log.d(TAG, "USB camera Ready: ${camera.deviceName}")
         } catch (cancel: kotlinx.coroutines.CancellationException) {
             // Caller (disconnect / detach) is tearing us down. Don't flip to Error —
             // let the cleanup path already in flight set the authoritative state.
@@ -808,19 +980,27 @@ class UsbCameraConnectionManager(
             throw cancel
         } catch (e: Exception) {
             Log.e(TAG, "USB connection error", e)
-            _connectionState.value = CameraConnectionState.Error(
-                "Couldn't connect to the camera. Unplug and replug the USB cable, then try again."
-            )
+            if (!initializationTimedOut.get()) {
+                _connectionState.value = CameraConnectionState.Error(
+                    "Couldn't connect to the camera. Unplug and replug the USB cable, then try again."
+                )
+            }
         } finally {
+            initializationWatchdog?.interrupt()
             // Release anything we opened if we didn't fully commit. Safe to call
             // on null refs / already-closed handles — each wrapped in try/catch.
             if (!committed) {
-                try { localCamera?.closeSession() } catch (e: Exception) { Log.w(TAG, "closeSession rollback: ${e.message}") }
+                // Do not write CloseSession into a pipe that already failed
+                // during initialization. It can block and overlap a new
+                // connection. Closing the USB handle is the rollback.
+                localEventListener?.cancelAndJoin()
+                localCamera?.setEventPumpActive(false)
                 if (ifaceClaimed && localIface != null && localConn != null) {
                     try { localConn.releaseInterface(localIface) } catch (e: Exception) { Log.w(TAG, "releaseInterface rollback: ${e.message}") }
                 }
                 try { localConn?.close() } catch (e: Exception) { Log.w(TAG, "connection close rollback: ${e.message}") }
             }
+            connectionRef.set(null)
         }
     }
 

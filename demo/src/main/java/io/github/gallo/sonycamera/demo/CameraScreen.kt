@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraOperationResult
 import io.github.gallo.sonycamera.service.CameraConnectionClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,6 +75,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var captured by remember { mutableStateOf<Bitmap?>(null) }
             var flash by remember { mutableStateOf(false) }
             var lastError by remember { mutableStateOf<String?>(null) }
+            var isCapturing by remember { mutableStateOf(false) }
 
             // Live-view frames stream in as Bitmaps.
             LaunchedEffect(camera) {
@@ -137,7 +139,22 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 Controls(
                     state = state,
                     onConnect = { lastError = null; camera.connectToCamera() },
-                    onCapture = { scope.launch { camera.takePhoto() } },
+                    isCapturing = isCapturing,
+                    onCapture = {
+                        if (!isCapturing) {
+                            isCapturing = true
+                            scope.launch {
+                                try {
+                                    val result = camera.takePhoto()
+                                    if (result is CameraOperationResult.Failure) {
+                                        lastError = result.message
+                                    }
+                                } finally {
+                                    isCapturing = false
+                                }
+                            }
+                        }
+                    },
                     onDisconnect = { camera.disconnect() },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -243,6 +260,7 @@ private fun StatusPill(
 private fun Controls(
     state: CameraConnectionState,
     onConnect: () -> Unit,
+    isCapturing: Boolean,
     onCapture: () -> Unit,
     onDisconnect: () -> Unit,
     modifier: Modifier = Modifier
@@ -254,7 +272,7 @@ private fun Controls(
     ) {
         when (state) {
             is CameraConnectionState.Ready -> {
-                ShutterButton(onClick = onCapture)
+                ShutterButton(enabled = !isCapturing, onClick = onCapture)
                 TextButton(onClick = onDisconnect) {
                     Text("Disconnect", color = Color.White.copy(0.7f), fontSize = 13.sp)
                 }
@@ -279,7 +297,7 @@ private fun Controls(
 }
 
 @Composable
-private fun ShutterButton(onClick: () -> Unit) {
+private fun ShutterButton(enabled: Boolean, onClick: () -> Unit) {
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(if (pressed) 0.9f else 1f, label = "shutterScale")
     Box(
@@ -287,19 +305,27 @@ private fun ShutterButton(onClick: () -> Unit) {
         modifier = Modifier
             .size(82.dp)
             .clip(CircleShape)
-            .background(Color.White.copy(alpha = 0.18f))
-            .clickable {
+            .background(Color.White.copy(alpha = if (enabled) 0.18f else 0.08f))
+            .clickable(enabled = enabled) {
                 pressed = true
                 onClick()
             }
     ) {
-        // Inner solid disc.
-        Box(
-            Modifier
-                .size((68 * scale).dp)
-                .clip(CircleShape)
-                .background(Color.White)
-        )
+        if (enabled) {
+            // Inner solid disc.
+            Box(
+                Modifier
+                    .size((68 * scale).dp)
+                    .clip(CircleShape)
+                    .background(Color.White)
+            )
+        } else {
+            CircularProgressIndicator(
+                color = Color.White,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(38.dp)
+            )
+        }
     }
     LaunchedEffect(pressed) {
         if (pressed) { delay(120); pressed = false }

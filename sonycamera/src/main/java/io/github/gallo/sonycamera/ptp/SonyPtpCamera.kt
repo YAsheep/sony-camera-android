@@ -5,6 +5,8 @@ import android.graphics.BitmapFactory
 import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 /**
  * Sony-specific PTP camera operations for the a6600 (and similar Alpha models).
@@ -48,6 +50,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     // Track consecutive liveview errors for adaptive backoff
     @Volatile
     private var consecutiveLiveviewErrors = 0
+    private var completedSdioPhase3 = false
+    private val eventQueue = LinkedBlockingQueue<PtpEvent>()
+
+    @Volatile
+    private var eventPumpActive = false
 
     /**
      * Open a PTP session. Must be called before any other operations.
@@ -89,6 +96,17 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             // gaps so a slow body still recovers in one user-perceived
             // attempt rather than forcing the user to tap Connect again.
             0x2002 -> {
+                // Recovery only: a failed/abandoned previous transaction can
+                // leave Sony's Bulk endpoints stalled. Reset the PTP device
+                // here, after a confirmed OpenSession I/O failure — never on
+                // a clean first connection.
+                Log.w(TAG, "OpenSession failed — performing recovery DeviceReset")
+                try {
+                    transport.resetDevice()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Recovery DeviceReset failed: ${e.message}")
+                }
+
                 val delays = longArrayOf(2000, 2500, 3000) // total ~7.5s worst case
                 for ((attempt, delayMs) in delays.withIndex()) {
                     Log.d(TAG, "General Error on openSession — settling ${delayMs}ms, retry ${attempt + 1}/${delays.size}")
@@ -156,17 +174,16 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             Log.w(TAG, "Error releasing Sony priority: ${e.message}")
         }
 
-        // SDIO close handshake (phase 3) — the explicit "exit PC Remote"
-        // hangup. We send phases 1 & 2 to open in initSonyExtension; phase 3
-        // is the corresponding close. It's known to stall the USB pipe on
-        // a6x00 bodies — fine here, because we close the connection right
-        // after. Without this, the camera typically keeps its "PC" indicator
-        // lit until the cable is physically yanked.
-        try {
-            transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 3, 0, 0)
-            Log.d(TAG, "Sony SDIO close (phase 3) sent")
-        } catch (e: Exception) {
-            Log.w(TAG, "Sony SDIO close (phase 3) errored — expected on a6x00: ${e.message}")
+        // Older a6x00 behavior in this library uses phase 3 as a best-effort
+        // hangup during teardown. Newer bodies such as ILCE-7C require phase 3
+        // during initialization instead, so never send it a second time here.
+        if (!completedSdioPhase3) {
+            try {
+                transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 3, 0, 0)
+                Log.d(TAG, "Sony SDIO teardown phase 3 sent")
+            } catch (e: Exception) {
+                Log.w(TAG, "Sony SDIO teardown phase 3 errored — expected on a6x00: ${e.message}")
+            }
         }
 
         closeSession()
@@ -177,27 +194,65 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      * and before any Sony vendor-specific commands.
      *
      * SDIOConnect returns data phases, so we use sendCommandWithData.
-     * Only phases 1 and 2 are needed — phase 3 stalls USB on a6600.
+     * The ILCE-7C requires phase 3 before control commands; it remains omitted
+     * during a6600 initialization because that body was observed to stall.
      */
     fun initSonyExtension(): Boolean {
         Log.d(TAG, "Initializing Sony SDIO extension...")
+        completedSdioPhase3 = false
 
         val r1 = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 1, 0, 0)
         Log.d(TAG, "SDIOConnect(1): ${PtpConstants.responseCodeName(r1.responseCode)}")
+        if (!r1.isSuccess) {
+            Log.e(TAG, "Sony SDIO initialization failed at connect phase 1")
+            return false
+        }
 
         val r2 = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 2, 0, 0)
         Log.d(TAG, "SDIOConnect(2): ${PtpConstants.responseCodeName(r2.responseCode)}")
+        if (!r2.isSuccess) {
+            Log.e(TAG, "Sony SDIO initialization failed at connect phase 2")
+            return false
+        }
 
         val extInfo = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO, 0xC8)
         Log.d(TAG, "GetExtDeviceInfo: ${PtpConstants.responseCodeName(extInfo.responseCode)}, ${extInfo.dataSize}B")
+        if (!extInfo.isSuccess || extInfo.data.isEmpty()) {
+            Log.e(TAG, "Sony SDIO initialization failed while reading extended device info")
+            return false
+        }
+
+        // libgphoto2 completes the three-phase SDIO handshake before acquiring
+        // control priority on the ILCE-7C (USB PID 0x0D2B). The a6600 path in
+        // this library intentionally remains two-phase due to observed stalls.
+        if (deviceName?.contains("ILCE-7C", ignoreCase = true) == true) {
+            val r3 = transport.sendCommandWithData(
+                PtpConstants.OP_SONY_SDIO_CONNECT, 3, 0, 0
+            )
+            Log.d(TAG, "SDIOConnect(3): ${PtpConstants.responseCodeName(r3.responseCode)}")
+            if (!r3.isSuccess) {
+                Log.e(TAG, "Sony SDIO initialization failed at connect phase 3")
+                return false
+            }
+            completedSdioPhase3 = true
+        }
 
         val props = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
         Log.d(TAG, "GetAllDevicePropData: ${PtpConstants.responseCodeName(props.responseCode)}, ${props.dataSize}B")
+        if (!props.isSuccess || props.data.isEmpty()) {
+            Log.e(TAG, "Sony SDIO initialization failed while reading camera properties")
+            return false
+        }
 
         // Tell camera that USB host has control — required before shutter commands work
-        setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
+        val priority = setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
+        if (!priority.isSuccess) {
+            Log.e(TAG, "Sony SDIO initialization failed while acquiring USB control priority")
+            return false
+        }
 
-        return r1.isSuccess && r2.isSuccess
+        Log.d(TAG, "Sony SDIO extension initialized")
+        return true
     }
 
     /**
@@ -266,44 +321,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
-     * Pre-warm the camera's shutter-handling pipeline.
-     *
-     * On a fresh PC-Remote session, the FIRST `SetControlDeviceB(SHUTTER_*)`
-     * command takes 8–10 seconds for the a6600 to acknowledge: the camera has
-     * to context-switch its firmware out of "stream liveview" into "process
-     * shutter", and the OUT endpoint NAKs until that's done. After that one
-     * tax is paid, subsequent shutter commands process in ~500ms.
-     *
-     * Call this once at the end of session init (before auto-starting
-     * liveview) so the first *real* capture the user triggers doesn't pay
-     * the warm-up cost — the user already expects a brief delay at connect.
-     *
-     * The cycle is half-press → release. No AF lock is held, no exposure
-     * happens, no photo is created. The lens motor may twitch briefly.
-     */
-    fun prewarmShutter() {
-        Log.d(TAG, "Pre-warming shutter pipeline (first command will be slow)…")
-        val started = System.currentTimeMillis()
-        try {
-            // Half-press: this is the slow one — eats the firmware context
-            // switch. We don't care about the response (typically a stall →
-            // General Error); we just need the camera to do the transition.
-            setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 2)
-            Thread.sleep(100)
-            // Release: clean up so the camera isn't sitting on a half-press.
-            setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 1)
-        } catch (e: Exception) {
-            // Pre-warm is best-effort; never fail the connection over it.
-            Log.w(TAG, "Pre-warm errored (non-fatal): ${e.message}")
-        }
-        val elapsed = System.currentTimeMillis() - started
-        Log.d(TAG, "Pre-warm complete in ${elapsed}ms — first capture should be fast")
-    }
-
-    /**
      * Initiate photo capture (shutter release).
      *
-     * Sony SetControlDeviceB (0x920A) requires a data-out phase:
+     * Sony SetControlDeviceB (0x9207) requires a data-out phase:
      *   Command param: property code (e.g., 0xD2C1 shutter half-press)
      *   Data payload:  value (2=press, 1=release)
      *
@@ -323,18 +343,22 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // Tune SHUTTER_TO_FLASH_DELAY_MS if the flash feels early/late.
         Log.d(TAG, "Capture: full-press shutter")
         val captureResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_FULL_PRESS, 2)
-        Thread.sleep(SHUTTER_TO_FLASH_DELAY_MS)
-        onShutterFired()
+        if (captureResult.commandDelivered) {
+            Thread.sleep(SHUTTER_TO_FLASH_DELAY_MS)
+            onShutterFired()
+        }
 
         // Release shutter
         Thread.sleep(200)
         setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_FULL_PRESS, 1)
         setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 1)
 
-        // With correct opcode (0x9207), camera should respond OK.
-        // If it still stalls, the command was still sent — check for ObjectAdded event.
-        val success = captureResult.isSuccess || afResult.isSuccess
-        Log.d(TAG, "Capture commands sent (af=${PtpConstants.responseCodeName(afResult.responseCode)}, " +
+        // Some Sony bodies execute 0x9207 without returning a PTP response.
+        // Complete Bulk OUT delivery is therefore the authoritative signal.
+        val success = captureResult.commandDelivered
+        Log.d(TAG, "Capture commands sent (afDelivered=${afResult.commandDelivered}, " +
+                "shutterDelivered=${captureResult.commandDelivered}, " +
+                "af=${PtpConstants.responseCodeName(afResult.responseCode)}, " +
                 "shutter=${PtpConstants.responseCodeName(captureResult.responseCode)})")
         return success
     }
@@ -711,9 +735,37 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
-     * Poll for events (non-blocking).
+     * Enable or disable the manager-owned continuous Interrupt IN pump.
+     *
+     * While enabled, event consumers read this queue instead of competing
+     * with the listener for the USB interrupt endpoint.
      */
-    fun pollEvent(timeoutMs: Int = 100): PtpEvent? = transport.readEvent(timeoutMs)
+    fun setEventPumpActive(active: Boolean) {
+        eventPumpActive = active
+        if (!active) eventQueue.clear()
+    }
+
+    /**
+     * Read one Interrupt IN event and enqueue it for higher-level consumers.
+     * Called continuously by the connection manager after Sony remote
+     * initialization until USB teardown.
+     */
+    fun pumpInterruptEvent(timeoutMs: Int = 250): PtpEvent? {
+        val event = transport.readEvent(timeoutMs)
+        if (event != null) eventQueue.offer(event)
+        return event
+    }
+
+    /**
+     * Poll for events without racing the continuous Interrupt IN listener.
+     */
+    fun pollEvent(timeoutMs: Int = 100): PtpEvent? {
+        return if (eventPumpActive) {
+            eventQueue.poll(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        } else {
+            transport.readEvent(timeoutMs)
+        }
+    }
 
     /**
      * Wait for an ObjectAdded event (after capture).
@@ -746,7 +798,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     private fun drainEvents() {
         var drained = 0
         while (drained < 20) {
-            val event = transport.readEvent(30) ?: break
+            val event = pollEvent(30) ?: break
             drained++
         }
     }
